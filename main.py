@@ -57,8 +57,15 @@ async def get_original_url(url):
             route.continue_() if request.resource_type in ['document', 'script'] else route.abort())
         
         page = await context.new_page()
-        response = await page.goto(url, wait_until="domcontentloaded", timeout=3000)  # wait for the HTML to load
-        return response.url
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=3000)
+            return response.url
+        except Exception as e:
+            print(f"An error occurred: {e}")
+        finally:
+            # Ensure all routes are removed before closing
+            await page.unroute_all()
+            await browser.close()
 
 async def get_link_preview(url):
     async with async_playwright() as p:
