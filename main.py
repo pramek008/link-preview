@@ -51,8 +51,13 @@ async def get_original_url(url):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
+
+        # Block unnecessary resources to make the loading faster
+        await context.route("**/*", lambda route, request: 
+            route.continue_() if request.resource_type in ['document', 'script'] else route.abort())
+        
         page = await context.new_page()
-        response = await page.goto(url)
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=3000)  # wait for the HTML to load
         return response.url
 
 async def get_link_preview(url):
