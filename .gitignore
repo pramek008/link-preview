@@ -3,3 +3,5 @@ config/__pycache__/platform_config.cpython-310.pyc
 models/__pycache__/schemas.cpython-310.pyc
 routes/__pycache__/link_preview.cpython-310.pyc
 services/__pycache__/link_preview_service.cpython-310.pyc
+routes/__pycache__/debug.cpython-310.pyc
+services/__pycache__/metadata_debug_service.cpython-310.pyc

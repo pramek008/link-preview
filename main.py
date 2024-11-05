@@ -1,12 +1,14 @@
 import logging
 from fastapi import FastAPI
 from routes.link_preview import router as link_preview_router
+from routes.debug import router as debug_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 app.include_router(link_preview_router, tags=["link-preview"])
+app.include_router(debug_router,prefix="/debug", tags=["debug"])
 
 # import asyncio
 # import logging
