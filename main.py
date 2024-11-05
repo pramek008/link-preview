@@ -32,6 +32,26 @@ PLATFORM_CONFIGS = {
         "description": ['meta[property="og:description"]'],
         "image": ['meta[property="og:image"]', 'meta[name="twitter:image"]'],
     }),
+    "facebook.com": PlatformConfig({
+        "title": ['meta[property="og:title"]', 'meta[name="twitter:title"]'],
+        "description": ['meta[property="og:description"]', 'meta[name="twitter:description"]'],
+        "image": ['meta[property="og:image"]', 'meta[name="twitter:image"]'],
+    }),
+    "youtube.com": PlatformConfig({
+        "title": ['meta[property="og:title"]', 'meta[name="twitter:title"]'],
+        "description": ['meta[property="og:description"]', 'meta[name="twitter:description"]'],
+        "image": ['meta[property="og:image"]', 'meta[name="twitter:image"]'],
+    }),
+    "linkedin.com": PlatformConfig({
+        "title": ['meta[property="og:title"]', 'meta[name="twitter:title"]'],
+        "description": ['meta[property="og:description"]', 'meta[name="twitter:description"]'],
+        "image": ['meta[property="og:image"]', 'meta[name="twitter:image"]'],
+    }),
+    "twitter.com": PlatformConfig({
+        "title": ['meta[property="og:title"]', 'meta[name="twitter:title"]'],
+        "description": ['meta[property="og:description"]', 'meta[name="twitter:description"]'],
+        "image": ['meta[property="og:image"]', 'meta[name="twitter:image"]'],
+    }),
 }
 
 async def get_element_content(page, selectors):
