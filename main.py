@@ -1,7 +1,11 @@
 import logging
+import os
 from fastapi import FastAPI
 from routes.link_preview import router as link_preview_router
 from routes.debug import router as debug_router
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

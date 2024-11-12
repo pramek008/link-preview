@@ -4,6 +4,7 @@ from playwright.async_api import async_playwright, Page
 from config.platform_config import PLATFORM_CONFIGS
 from models.schemas import LinkPreview
 from typing import Optional, List
+from fastapi import HTTPException
 
 
 logger = logging.getLogger(__name__)
@@ -154,4 +155,61 @@ class LinkPreviewService:
             finally:
                 await page.unroute_all()
                 await browser.close()
+                
+    @staticmethod
+    async def get_all_images(page: Page, base_url: str) -> List[str]:
+        images = await page.query_selector_all("img")
+        image_urls = []
+        
+        for img in images:
+            src = await img.get_attribute("src")
+            actual_url = LinkPreviewService.get_actual_image_url(base_url, src)
+            if actual_url:
+                image_urls.append(actual_url)
+                
+        return image_urls
 
+    @staticmethod
+    async def get_images(url: str) :
+        if not url:
+            raise HTTPException(status_code=400, detail="URL parameter is required")
+            
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox']
+            )
+            
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            )
+            
+            page = await context.new_page()
+            
+            # Configure request interception
+            async def handle_route(route):
+                if route.request.resource_type in ["document", "script", "image"]:
+                    await route.continue_()
+                else:
+                    await route.abort()
+                    
+            await page.route("**/*", handle_route)
+                
+            try:
+                # Navigate to the URL
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+                final_url = page.url
+                
+                # Get all images
+                image_urls = await LinkPreviewService.get_all_images(page, final_url)
+                
+                if not image_urls:
+                    raise HTTPException(status_code=400, detail="No images found")
+                    
+                return image_urls
+                
+            except Exception as e:
+                print(f"Error processing request: {str(e)}")
+                raise HTTPException(status_code=500, detail="Internal server error")
+            finally:
+                await browser.close()

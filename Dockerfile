@@ -8,8 +8,8 @@ WORKDIR /app
 COPY . /app
 
 # Install any needed packages specified in requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install fastapi uvicorn playwright && \
+RUN pip install --upgrade pip && \
+    pip install fastapi uvicorn playwright python-dotenv aiohttp && \
     playwright install --with-deps chromium
 
 # Make port 80 available to the world outside this container
@@ -19,4 +19,4 @@ EXPOSE 80
 ENV PYTHONUNBUFFERED=1
 
 # Run the FastAPI app with Uvicorn server
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
