@@ -187,13 +187,13 @@ class LinkPreviewService:
             page = await context.new_page()
             
             # Configure request interception
-            async def handle_route(route):
-                if route.request.resource_type in ["document", "script", "image"]:
-                    await route.continue_()
-                else:
-                    await route.abort()
+            # async def handle_route(route):
+            #     if route.request.resource_type in ["document", "script", "image"]:
+            #         await route.continue_()
+            #     else:
+            #         await route.abort()
                     
-            await page.route("**/*", handle_route)
+            # await page.route("**/*", handle_route)
                 
             try:
                 # Navigate to the URL
