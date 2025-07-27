@@ -5,25 +5,47 @@ from config.platform_config import PLATFORM_CONFIGS
 from models.schemas import LinkPreview
 from typing import Optional, List
 from fastapi import HTTPException
+import asyncio
 
 
 logger = logging.getLogger(__name__)
 
 class LinkPreviewService:
+    
+    @staticmethod
+    def get_user_agent(domain: str) -> str:
+        """Get appropriate user agent for specific domains"""
+        if 'tiktok.com' in domain:
+            return 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1'
+        elif 'twitter.com' in domain or 'x.com' in domain:
+            return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        else:
+            return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
     @staticmethod
     async def get_element_content(page: Page, selectors: list) -> Optional[str]:
         for selector in selectors:
             try:
-                if '[data-testid' in selector:  # Special handling for Twitter
+                # Special handling for data-testid and data-e2e selectors
+                if '[data-testid' in selector or '[data-e2e' in selector:
                     element = await page.query_selector(selector)
                     if element:
-                        return await element.inner_text()
+                        text = await element.inner_text()
+                        if text and text.strip():
+                            return text.strip()
                 else:
                     element = await page.query_selector(selector)
                     if element:
-                        return await element.get_attribute('content') or await element.inner_text()
+                        # Try content attribute first, then inner_text
+                        content = await element.get_attribute('content')
+                        if content and content.strip():
+                            return content.strip()
+                        
+                        text = await element.inner_text()
+                        if text and text.strip():
+                            return text.strip()
             except Exception as e:
-                logger.error(f"Error getting element content: {str(e)}")
+                logger.error(f"Error getting element content with selector {selector}: {str(e)}")
                 continue
         return None
 
@@ -31,146 +53,248 @@ class LinkPreviewService:
     def get_actual_image_url(base_url: str, image_url: Optional[str]) -> Optional[str]:
         if not image_url or image_url.strip() == '' or image_url.startswith('data:'):
             return None
-
-        if '.svg' in image_url or '.gif' in image_url:
+        
+        # Skip very small images or common placeholders
+        if any(x in image_url.lower() for x in ['.svg', '.gif', 'placeholder', 'default']):
             return None
-
+            
         if image_url.startswith('//'):
             image_url = f'https:{image_url}'
-
-        if not image_url.startswith('http'):
+        elif not image_url.startswith('http'):
             base_url = base_url.rstrip('/')
             image_url = image_url.lstrip('/')
             return f'{base_url}/{image_url}'
-
+        
         return image_url
 
     @staticmethod
-    async def get_main_image_url(page: Page, base_url: str, is_twitter: bool = False) -> Optional[str]:
-        if is_twitter:
-            # Try to get tweet image first
-            tweet_image = await page.query_selector('[data-testid="tweetPhoto"] img')
-            if tweet_image:
-                src = await tweet_image.get_attribute('src')
-                return LinkPreviewService.get_actual_image_url(base_url, src)
-
-        # Try meta tags
-        meta_elements = await page.query_selector_all('meta[property="og:image"], meta[name="twitter:image"]')
-        for element in meta_elements:
-            image_url = await element.get_attribute('content')
-            actual_url = LinkPreviewService.get_actual_image_url(base_url, image_url)
-            if actual_url:
-                return actual_url
-
-        # Fallback to largest image
+    async def get_main_image_url(page: Page, base_url: str, domain: str) -> Optional[str]:
         try:
+            # TikTok specific image handling
+            if 'tiktok.com' in domain:
+                # Try TikTok specific selectors first
+                tiktok_selectors = [
+                    '[data-e2e="browse-video-cover"] img',
+                    'img[alt*="video"]',
+                    'video[poster]'
+                ]
+                
+                for selector in tiktok_selectors:
+                    try:
+                        if selector == 'video[poster]':
+                            element = await page.query_selector(selector)
+                            if element:
+                                poster = await element.get_attribute('poster')
+                                if poster:
+                                    return LinkPreviewService.get_actual_image_url(base_url, poster)
+                        else:
+                            element = await page.query_selector(selector)
+                            if element:
+                                src = await element.get_attribute('src')
+                                actual_url = LinkPreviewService.get_actual_image_url(base_url, src)
+                                if actual_url:
+                                    return actual_url
+                    except Exception:
+                        continue
+
+            # Twitter specific image handling
+            elif 'twitter.com' in domain or 'x.com' in domain:
+                tweet_image = await page.query_selector('[data-testid="tweetPhoto"] img')
+                if tweet_image:
+                    src = await tweet_image.get_attribute('src')
+                    actual_url = LinkPreviewService.get_actual_image_url(base_url, src)
+                    if actual_url:
+                        return actual_url
+
+            # Try meta tags for all platforms
+            meta_selectors = [
+                'meta[property="og:image"]',
+                'meta[name="twitter:image"]',
+                'meta[property="og:image:url"]'
+            ]
+            
+            for selector in meta_selectors:
+                try:
+                    element = await page.query_selector(selector)
+                    if element:
+                        image_url = await element.get_attribute('content')
+                        actual_url = LinkPreviewService.get_actual_image_url(base_url, image_url)
+                        if actual_url:
+                            return actual_url
+                except Exception:
+                    continue
+
+            # Fallback to largest image
             images = await page.query_selector_all('img')
             largest_image = None
             largest_area = 0
-
-            for img in images:
-                src = await img.get_attribute('src')
-                actual_url = LinkPreviewService.get_actual_image_url(base_url, src)
-                if not actual_url:
+            
+            for img in images[:10]:  # Limit to first 10 images for performance
+                try:
+                    src = await img.get_attribute('src')
+                    actual_url = LinkPreviewService.get_actual_image_url(base_url, src)
+                    if not actual_url:
+                        continue
+                    
+                    box = await img.bounding_box()
+                    if box and box["width"] and box["height"]:
+                        area = box["width"] * box["height"]
+                        if area > largest_area and area > 10000:  # Minimum size threshold
+                            largest_area = area
+                            largest_image = actual_url
+                except Exception:
                     continue
-
-                box = await img.bounding_box()
-                if box and box["width"] and box["height"]:
-                    area = box["width"] * box["height"]
-                    if area > largest_area:
-                        largest_area = area
-                        largest_image = actual_url
-
+                    
             return largest_image
+            
         except Exception as e:
-            logger.error(f"Error finding largest image: {str(e)}")
+            logger.error(f"Error finding image for {domain}: {str(e)}")
             return None
+
+    @staticmethod
+    async def setup_page_optimizations(page: Page, domain: str):
+        """Setup page optimizations based on domain"""
+        # Block unnecessary resources for faster loading
+        await page.route("**/*", lambda route, request: (
+            route.continue_() if request.resource_type in ['document', 'script', 'xhr', 'fetch'] 
+            else route.abort()
+        ))
+        
+        # Set viewport for mobile sites like TikTok
+        if 'tiktok.com' in domain:
+            await page.set_viewport_size({"width": 375, "height": 667})
+        else:
+            await page.set_viewport_size({"width": 1280, "height": 720})
 
     @staticmethod
     async def get_link_preview(url: str) -> Optional[LinkPreview]:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36'
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--no-first-run',
+                    '--disable-extensions'
+                ]
             )
             
-            # Set up route handling
-            await context.route("**/*", lambda route, request: 
-                route.continue_() if request.resource_type in ['document', 'script', 'image'] else route.abort())
-
+            domain = urlparse(url).netloc
+            user_agent = LinkPreviewService.get_user_agent(domain)
+            
+            context = await browser.new_context(
+                user_agent=user_agent,
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9'
+                }
+            )
+            
             page = await context.new_page()
             
             try:
+                # Setup optimizations
+                await LinkPreviewService.setup_page_optimizations(page, domain)
+                
                 logger.info(f"Fetching preview for URL: {url}")
-                response = await page.goto(url, wait_until="networkidle")
-                final_url = response.url
-                domain = urlparse(final_url).netloc
                 
-                # Special handling for Twitter
-                is_twitter = 'twitter.com' in domain
-                if is_twitter:
-                    # Wait for tweet content to load
-                    await page.wait_for_selector('[data-testid="tweetText"]', timeout=5000)
-                
-                config = PLATFORM_CONFIGS.get(domain, PLATFORM_CONFIGS["default"])
-                
-                main_image = await LinkPreviewService.get_main_image_url(
-                    page, 
-                    final_url,
-                    is_twitter=is_twitter
+                # Navigate with shorter timeout and different wait strategy
+                response = await page.goto(
+                    url, 
+                    wait_until="domcontentloaded",  # Changed from networkidle
+                    timeout=10000  # Reduced from 30000
                 )
+                
+                if not response or response.status >= 400:
+                    logger.error(f"Failed to load page: {response.status if response else 'No response'}")
+                    return None
+                
+                final_url = response.url
+                parsed_domain = urlparse(final_url).netloc
+                
+                # Wait for specific content based on platform
+                if 'tiktok.com' in parsed_domain:
+                    try:
+                        await page.wait_for_selector('[data-e2e="browse-video-desc"], [data-e2e="video-desc"]', timeout=5000)
+                    except:
+                        pass  # Continue even if specific selector not found
+                elif 'twitter.com' in parsed_domain or 'x.com' in parsed_domain:
+                    try:
+                        await page.wait_for_selector('[data-testid="tweetText"]', timeout=5000)
+                    except:
+                        pass
+                
+                # Small delay to ensure content is loaded
+                await asyncio.sleep(1)
+                
+                config = PLATFORM_CONFIGS.get(parsed_domain, PLATFORM_CONFIGS["default"])
+                
+                # Get content
+                title = await LinkPreviewService.get_element_content(page, config.selectors.title)
+                description = await LinkPreviewService.get_element_content(page, config.selectors.description)
+                main_image = await LinkPreviewService.get_main_image_url(page, final_url, parsed_domain)
                 
                 preview = LinkPreview(
                     url=final_url,
-                    title=await LinkPreviewService.get_element_content(page, config.selectors.title),
-                    description=await LinkPreviewService.get_element_content(page, config.selectors.description),
+                    title=title,
+                    description=description,
                     image=main_image
                 )
                 
                 logger.info(f"Successfully generated preview for URL: {final_url}")
+                logger.info(f"Title: {title}")
+                logger.info(f"Description: {description}")
+                logger.info(f"Image: {main_image}")
+                
                 return preview
                 
             except Exception as e:
                 logger.error(f"Error generating preview for URL {url}: {str(e)}")
                 return None
-                
             finally:
                 await browser.close()
-    
+
     @staticmethod
-    async def get_original_url(url):
+    async def get_original_url(url: str):
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context()
-
-            await context.route("**/*", lambda route, request: 
-                route.continue_() if request.resource_type in ['document', 'script'] else route.abort())
+            
+            # Block resources for faster loading
+            await context.route("**/*", lambda route, request: (
+                route.continue_() if request.resource_type in ['document'] 
+                else route.abort()
+            ))
             
             page = await context.new_page()
             try:
-                response = await page.goto(url, wait_until="domcontentloaded", timeout=3000)
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=5000)
                 return response.url
             except Exception as e:
                 logger.error(f"An error occurred: {e}")
+                return url
             finally:
-                await page.unroute_all()
                 await browser.close()
-                
+
     @staticmethod
     async def get_all_images(page: Page, base_url: str) -> List[str]:
         images = await page.query_selector_all("img")
         image_urls = []
         
         for img in images:
-            src = await img.get_attribute("src")
-            actual_url = LinkPreviewService.get_actual_image_url(base_url, src)
-            if actual_url:
-                image_urls.append(actual_url)
+            try:
+                src = await img.get_attribute("src")
+                actual_url = LinkPreviewService.get_actual_image_url(base_url, src)
+                if actual_url:
+                    image_urls.append(actual_url)
+            except Exception:
+                continue
                 
         return image_urls
 
     @staticmethod
-    async def get_images(url: str) :
+    async def get_images(url: str):
         if not url:
             raise HTTPException(status_code=400, detail="URL parameter is required")
             
@@ -181,26 +305,14 @@ class LinkPreviewService:
             )
             
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             
             page = await context.new_page()
             
-            # Configure request interception
-            # async def handle_route(route):
-            #     if route.request.resource_type in ["document", "script", "image"]:
-            #         await route.continue_()
-            #     else:
-            #         await route.abort()
-                    
-            # await page.route("**/*", handle_route)
-                
             try:
-                # Navigate to the URL
-                await page.goto(url, wait_until="networkidle", timeout=30000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 final_url = page.url
-                
-                # Get all images
                 image_urls = await LinkPreviewService.get_all_images(page, final_url)
                 
                 if not image_urls:
@@ -209,7 +321,7 @@ class LinkPreviewService:
                 return image_urls
                 
             except Exception as e:
-                print(f"Error processing request: {str(e)}")
+                logger.error(f"Error processing request: {str(e)}")
                 raise HTTPException(status_code=500, detail="Internal server error")
             finally:
                 await browser.close()

@@ -11,7 +11,7 @@ async def preview(url: str):
         return preview
     raise HTTPException(status_code=400, detail="Could not generate preview")
 
-@router.get("/original-url",)
+@router.get("/original-url")
 async def original_url(url: str):
     original_url = await LinkPreviewService.get_original_url(url)
     return {"original_url": original_url}
