@@ -1,4 +1,5 @@
 import logging
+import re
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page
 from config.platform_config import PLATFORM_CONFIGS
@@ -6,11 +7,14 @@ from models.schemas import LinkPreview
 from typing import Optional, List
 from fastapi import HTTPException
 import asyncio
+from utils.playwright_utils import PlaywrightManager, get_page
 
 logger = logging.getLogger(__name__)
 
+# Global instance
+playwright_manager = PlaywrightManager()
+
 class LinkPreviewService:
-    
     @staticmethod
     def get_user_agent(domain: str) -> str:
         """Get appropriate user agent for specific domains"""
@@ -46,7 +50,6 @@ class LinkPreviewService:
                         content = await element.get_attribute('content')
                         if content and content.strip():
                             return content.strip()
-                        
                         text = await element.inner_text()
                         if text and text.strip():
                             return text.strip()
@@ -67,7 +70,7 @@ class LinkPreviewService:
         # Allow .gif for YouTube (some thumbnails might be gif)
         if '.gif' in image_url.lower() and 'ytimg.com' not in image_url.lower():
             return None
-            
+        
         if image_url.startswith('//'):
             image_url = f'https:{image_url}'
         elif not image_url.startswith('http'):
@@ -88,7 +91,6 @@ class LinkPreviewService:
                     '.fade-appear-done img',
                     'img[alt*="product"]'
                 ]
-                
                 for selector in tokped_selectors:
                     try:
                         element = await page.query_selector(selector)
@@ -101,7 +103,7 @@ class LinkPreviewService:
                                 return actual_url
                     except Exception:
                         continue
-
+                        
             elif 'shopee.co.id' in domain:
                 shopee_selectors = [
                     '[class*="product-image"] img',
@@ -110,7 +112,6 @@ class LinkPreviewService:
                     'img[alt*="product"]',
                     'div[style*="background-image"]'
                 ]
-                
                 for selector in shopee_selectors:
                     try:
                         if 'background-image' in selector:
@@ -118,7 +119,6 @@ class LinkPreviewService:
                             if element:
                                 style = await element.get_attribute('style')
                                 if style and 'background-image' in style:
-                                    import re
                                     match = re.search(r'background-image:\s*url\(["\']?([^"\']+)["\']?\)', style)
                                     if match:
                                         img_url = match.group(1)
@@ -136,7 +136,7 @@ class LinkPreviewService:
                                     return actual_url
                     except Exception:
                         continue
-
+                        
             elif 'amazon.com' in domain or 'amazon.co.id' in domain:
                 amazon_selectors = [
                     '#landingImage',
@@ -144,7 +144,6 @@ class LinkPreviewService:
                     '.a-dynamic-image',
                     '#imgTagWrapperId img'
                 ]
-                
                 for selector in amazon_selectors:
                     try:
                         element = await page.query_selector(selector)
@@ -169,7 +168,6 @@ class LinkPreviewService:
                     'img[alt*="video"]',
                     'video[poster]'
                 ]
-                
                 for selector in tiktok_selectors:
                     try:
                         if selector == 'video[poster]':
@@ -204,7 +202,6 @@ class LinkPreviewService:
                 'meta[name="twitter:image"]',
                 'meta[property="og:image:url"]'
             ]
-            
             for selector in meta_selectors:
                 try:
                     logger.info(f"Trying meta selector: {selector}")
@@ -221,7 +218,7 @@ class LinkPreviewService:
                     logger.error(f"Error with meta selector {selector}: {str(e)}")
                     continue
 
-            # Fallback to largest image (only for non-ecommerce sites to avoid clutter)
+            # Fallback to largest image (only for non-e-commerce sites to avoid clutter)
             if not any(site in domain for site in ['tokopedia.com', 'shopee.co.id', 'amazon.com']):
                 images = await page.query_selector_all('img')
                 largest_image = None
@@ -256,8 +253,8 @@ class LinkPreviewService:
         """Setup page optimizations based on domain"""
         # Sites that need images for proper preview
         needs_images = [
-            'tokopedia.com', 'shopee.co.id', 'amazon.com', 'bukalapak.com', 'blibli.com',
-            'youtube.com', 'youtu.be'  # YouTube needs images for thumbnails
+            'tokopedia.com', 'shopee.co.id', 'amazon.com', 
+            'bukalapak.com', 'blibli.com', 'youtube.com', 'youtu.be'  # YouTube needs images for thumbnails
         ]
         
         if any(site in domain for site in needs_images):
@@ -281,43 +278,16 @@ class LinkPreviewService:
 
     @staticmethod
     async def get_link_preview(url: str) -> Optional[LinkPreview]:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--no-first-run',
-                    '--disable-extensions'
-                ]
-            )
-            
-            domain = urlparse(url).netloc
-            user_agent = LinkPreviewService.get_user_agent(domain)
-            
-            context = await browser.new_context(
-                user_agent=user_agent,
-                extra_http_headers={
-                    'Accept-Language': 'en-US,en;q=0.9'
-                }
-            )
-            
-            page = await context.new_page()
-            
+        domain = urlparse(url).netloc
+        
+        async with playwright_manager.get_page(domain) as page:
             try:
                 # Setup optimizations
                 await LinkPreviewService.setup_page_optimizations(page, domain)
-                
-                logger.info(f"Fetching preview for URL: {url}")
+                logger.info(f"Fetching preview for URL: {url}")                
                 
                 # Navigate with shorter timeout and different wait strategy
-                response = await page.goto(
-                    url, 
-                    wait_until="domcontentloaded",  # Changed from networkidle
-                    timeout=15000  # Increased for e-commerce sites
-                )
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 
                 if not response or response.status >= 400:
                     logger.error(f"Failed to load page: {response.status if response else 'No response'}")
@@ -327,35 +297,7 @@ class LinkPreviewService:
                 parsed_domain = urlparse(final_url).netloc
                 
                 # Wait for specific content based on platform
-                if 'tokopedia.com' in parsed_domain:
-                    try:
-                        # Wait for either product name or meta tags to load
-                        await page.wait_for_selector('[data-testid="lblPDPProductName"], meta[property="og:title"]', timeout=8000)
-                        await asyncio.sleep(2)  # Extra wait for JS to populate meta tags
-                    except:
-                        pass
-                elif 'shopee.co.id' in parsed_domain:
-                    try:
-                        await page.wait_for_selector('[data-testid="pdp-product-title"], meta[property="og:title"]', timeout=8000)
-                        await asyncio.sleep(2)  # Extra wait for JS to populate meta tags
-                    except:
-                        pass
-                elif 'amazon.com' in parsed_domain or 'amazon.co.id' in parsed_domain:
-                    try:
-                        await page.wait_for_selector('#productTitle, meta[property="og:title"]', timeout=8000)
-                        await asyncio.sleep(1)
-                    except:
-                        pass
-                elif 'tiktok.com' in parsed_domain:
-                    try:
-                        await page.wait_for_selector('[data-e2e="browse-video-desc"], [data-e2e="video-desc"]', timeout=5000)
-                    except:
-                        pass  # Continue even if specific selector not found
-                elif 'twitter.com' in parsed_domain or 'x.com' in parsed_domain:
-                    try:
-                        await page.wait_for_selector('[data-testid="tweetText"]', timeout=5000)
-                    except:
-                        pass
+                await LinkPreviewService._wait_for_platform_content(page, parsed_domain)
                 
                 config = PLATFORM_CONFIGS.get(parsed_domain, PLATFORM_CONFIGS["default"])
                 
@@ -381,30 +323,43 @@ class LinkPreviewService:
             except Exception as e:
                 logger.error(f"Error generating preview for URL {url}: {str(e)}")
                 return None
-            finally:
-                await browser.close()
+
+    @staticmethod
+    async def _wait_for_platform_content(page: Page, domain: str):
+        """Wait for platform-specific content to load"""
+        try:
+            if 'tokopedia.com' in domain:
+                await page.wait_for_selector('[data-testid="lblPDPProductName"], meta[property="og:title"]', timeout=8000)
+                await asyncio.sleep(2)  # Extra wait for JS to populate meta tags
+            elif 'shopee.co.id' in domain:
+                await page.wait_for_selector('[data-testid="pdp-product-title"], meta[property="og:title"]', timeout=8000)
+                await asyncio.sleep(2)  # Extra wait for JS to populate meta tags
+            elif 'amazon.com' in domain or 'amazon.co.id' in domain:
+                await page.wait_for_selector('#productTitle, meta[property="og:title"]', timeout=8000)
+                await asyncio.sleep(1)
+            elif 'tiktok.com' in domain:
+                await page.wait_for_selector('[data-e2e="browse-video-desc"], [data-e2e="video-desc"]', timeout=5000)
+            elif 'twitter.com' in domain or 'x.com' in domain:
+                await page.wait_for_selector('[data-testid="tweetText"]', timeout=5000)
+        except Exception:
+            # Continue even if specific selector not found
+            pass
 
     @staticmethod
     async def get_original_url(url: str):
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
-            
-            # Block resources for faster loading
-            await context.route("**/*", lambda route, request: (
-                route.continue_() if request.resource_type in ['document'] 
-                else route.abort()
-            ))
-            
-            page = await context.new_page()
+        async with playwright_manager.get_page() as page:
             try:
+                # Block resources for faster loading
+                await page.route("**/*", lambda route, request: (
+                    route.continue_() if request.resource_type in ['document'] 
+                    else route.abort()
+                ))
+                
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=5000)
                 return response.url
             except Exception as e:
                 logger.error(f"An error occurred: {e}")
                 return url
-            finally:
-                await browser.close()
 
     @staticmethod
     async def get_all_images(page: Page, base_url: str) -> List[str]:
@@ -426,19 +381,8 @@ class LinkPreviewService:
     async def get_images(url: str):
         if not url:
             raise HTTPException(status_code=400, detail="URL parameter is required")
-            
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox']
-            )
-            
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-            
-            page = await context.new_page()
-            
+        
+        async with playwright_manager.get_page() as page:
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=15000)
                 final_url = page.url
@@ -446,11 +390,9 @@ class LinkPreviewService:
                 
                 if not image_urls:
                     raise HTTPException(status_code=400, detail="No images found")
-                    
+                
                 return image_urls
                 
             except Exception as e:
                 logger.error(f"Error processing request: {str(e)}")
                 raise HTTPException(status_code=500, detail="Internal server error")
-            finally:
-                await browser.close()
