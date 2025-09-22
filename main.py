@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from routes.link_preview import router as link_preview_router
 from routes.debug import router as debug_router
 from dotenv import load_dotenv
+from utils.playwright_utils import playwright_manager
 
 load_dotenv()
 
@@ -13,6 +14,17 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 app.include_router(link_preview_router, tags=["link-preview"])
 app.include_router(debug_router,prefix="/debug", tags=["debug"])
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Initializing Playwright...")
+    await playwright_manager.initialize()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Closing Playwright...")
+    await playwright_manager.close()
 
 # import asyncio
 # import logging

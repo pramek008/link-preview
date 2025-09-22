@@ -1,3 +1,10 @@
 flask==2.0.1
 pydantic==1.8.2
 python-dotenv
+aiohttp==3.8.5
+asyncio
+fastapi 
+uvicorn 
+playwright 
+loguru==0.7.2
+httpx
