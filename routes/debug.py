@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from services.metadata_debug_service import MetadataDebugService
 import os
 from dotenv import load_dotenv
+import logging 
 
 load_dotenv()
 
@@ -28,3 +29,16 @@ async def debug_metadata(
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    
+@router.get("/compare-methods")
+async def compare_methods(request: Request):
+    url = request.query_params.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Please provide a valid URL.")
+
+    try:
+        result = await MetadataDebugService.compare_navigation_methods(url)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        

@@ -1,9 +1,13 @@
+
+import time
 from typing import Dict, Any
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 import logging
 import random
 import asyncio
+from utils.playwright_utils import get_page, navigate_and_wait, navigate_and_wait_v2,navigate_and_wait_v3
+# import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -181,3 +185,32 @@ class MetadataDebugService:
             metadata['error'] = f"Unexpected error: {str(e)}"
 
         return metadata
+    
+    async def compare_navigation_methods(tiktok_link):
+        async with await get_page() as page1, await get_page() as page2, await get_page() as page3:
+            # Measure time for the first method
+            start_time_1 = time.perf_counter()
+            await navigate_and_wait(page1, tiktok_link)
+            end_time_1 = time.perf_counter()
+            duration_1 = end_time_1 - start_time_1
+
+            # Measure time for the second method
+            start_time_2 = time.perf_counter()
+            await navigate_and_wait_v2(page2, tiktok_link)
+            end_time_2 = time.perf_counter()
+            duration_2 = end_time_2 - start_time_2
+
+            # Measure time for the third method
+            start_time_3 = time.perf_counter()
+            await navigate_and_wait_v3(page3, tiktok_link)
+            end_time_3 = time.perf_counter()
+            duration_3 = end_time_3 - start_time_3
+
+            return {
+                "method_1_duration": duration_1,
+                "method_2_duration": duration_2,
+                "method_3_duration": duration_3,
+                "url_method_1": page1.url,
+                "url_method_2": page2.url,
+                "url_method_3": page3.url
+            }
