@@ -130,6 +130,11 @@ async def navigate_and_wait_v2(page, url, timeout=30000):
             else:
                 await route.continue_()
 
+        # Set user agent
+        await page.set_extra_http_headers({
+            "User-Agent": "WhatsApp/2.23.2.72 A"
+        })
+        
         # Set up routing to block unnecessary resources
         await page.route("**/*", handle_route)
         
@@ -138,8 +143,8 @@ async def navigate_and_wait_v2(page, url, timeout=30000):
     except Exception as e:
         logger.error(f"Error navigating to {url}: {str(e)}")
         raise
-    finally:
-        await page.close()
+    # finally:
+    #     await page.close()
 
 async def navigate_and_wait_v3(page, url, timeout=30000):
     try:
@@ -153,8 +158,24 @@ async def navigate_and_wait_v3(page, url, timeout=30000):
     except Exception as e:
         logger.error(f"Error navigating to {url}: {str(e)}")
         raise
-    finally:
-        await page.close()
+    # finally:
+    #     await page.close()
+
+async def navigate_to_resolve_redirect(url: str, timeout=10) -> str:
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        async with httpx.AsyncClient(
+            follow_redirects=True, 
+            timeout=timeout,
+            headers=headers
+        ) as client:
+            response = await client.get(url)
+            return str(response.url)
+    except Exception as e:
+        logger.error(f"Redirect resolution error for {url}: {str(e)}")
+        return url
 
 # async def navigate_and_wait_v2(page, url, timeout=30000):
 #     try:

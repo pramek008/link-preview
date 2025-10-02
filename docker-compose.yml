@@ -8,9 +8,19 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
-    networks:
-      - main_network
-
-networks:
-  main_network:
-    external: true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "1.0"
+          memory: 1G
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "4.0"
+    #       memory: 4G
+    #     reservations:
+    #       cpus: "2.0"
+    #       memory: 2G

@@ -7,7 +7,7 @@ from models.schemas import LinkPreview
 from typing import Optional, List
 from fastapi import HTTPException
 import asyncio
-from utils.playwright_utils import PlaywrightManager, get_page
+from utils.playwright_utils import PlaywrightManager, get_page, navigate_and_wait_v2, navigate_and_wait_v3, navigate_to_resolve_redirect, resolve_redirect
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +19,9 @@ class LinkPreviewService:
     def get_user_agent(domain: str) -> str:
         """Get appropriate user agent for specific domains"""
         # E-commerce sites often work better with WhatsApp user agent
-        if 'tokopedia.com' in domain:
-            return 'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
-        elif any(site in domain for site in ['shopee.co.id', 'bukalapak.com', 'blibli.com']):
+        # if 'tokopedia.com' in domain:
+        #     return 'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+        if any(site in domain for site in ['shopee.co.id', 'bukalapak.com', 'blibli.com', 'lazada.co.id','tokopedia.com']):
             return 'WhatsApp/2.23.2.72 A'
         elif 'tiktok.com' in domain:
             return 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1'
@@ -279,12 +279,18 @@ class LinkPreviewService:
     @staticmethod
     async def get_link_preview(url: str) -> Optional[LinkPreview]:
         domain = urlparse(url).netloc
+        # Resolve redirect untuk logging/checking
+        resolved_url = await navigate_to_resolve_redirect(url)
+        logger.info(f"Resolved URL: {resolved_url}")
         
-        async with playwright_manager.get_page(domain) as page:
+        # Dapatkan domain yang benar untuk page pool
+        resolved_domain = urlparse(resolved_url).netloc
+        
+        async with playwright_manager.get_page(resolved_domain) as page:
             try:
                 # Setup optimizations
                 await LinkPreviewService.setup_page_optimizations(page, domain)
-                logger.info(f"Fetching preview for URL: {url}")                
+                logger.info(f"Fetching preview for URL: {url}")                        
                 
                 # Navigate with shorter timeout and different wait strategy
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
