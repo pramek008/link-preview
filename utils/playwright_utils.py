@@ -1,25 +1,58 @@
-from playwright.async_api import async_playwright
 import asyncio
-import logging
-import re
 from contextlib import asynccontextmanager
-import httpx
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-class PlaywrightManager:
-    def __init__(self):
+@dataclass
+class BrowserInstance:
+    browser: Browser
+    context: BrowserContext
+    semaphore: asyncio.Semaphore
+    created_at: float
+    last_used: float
+    active_tabs: int = 0
+    total_requests: int = 0  # Track total requests per browser
+
+class AdvancedPlaywrightManager:
+    def __init__(
+        self, 
+        max_tabs_per_browser: int = 25,
+        max_browsers: int = 3,
+        auto_scale: bool = True,
+        browser_idle_timeout: int = 900,
+        min_browsers: int = 1
+    ):
         self.playwright = None
-        self.browser = None
-        self.context = None
+        self.browsers: List[BrowserInstance] = []
+        self.max_tabs_per_browser = max_tabs_per_browser
+        self.max_browsers = max_browsers
+        self.min_browsers = min_browsers
+        self.auto_scale = auto_scale
+        self.browser_idle_timeout = browser_idle_timeout
+        
         self.lock = asyncio.Lock()
-        self.last_used = 0
-        self.close_task = None
+        self.cleanup_task = None
+        
+        # Enhanced stats
+        self.stats = {
+            'total_requests': 0,
+            'active_tabs': 0,
+            'browsers_created': 0,
+            'browsers_closed': 0,
+            'failed_requests': 0,
+            'successful_requests': 0,
+            'peak_active_tabs': 0,
+            'peak_browsers': 0
+        }
     
     @staticmethod
     def get_user_agent(domain: str) -> str:
         """Get appropriate user agent for specific domains"""
-        # E-commerce sites often work better with WhatsApp user agent
         if 'tokopedia.com' in domain:
             return 'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
         elif any(site in domain for site in ['shopee.co.id', 'bukalapak.com', 'blibli.com']):
@@ -33,74 +66,265 @@ class PlaywrightManager:
         else:
             return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
-
     async def initialize(self):
+        """Initialize playwright and create minimum number of browsers"""
         async with self.lock:
             if self.playwright is None:
+                logger.info("Starting Playwright...")
                 self.playwright = await async_playwright().start()
-                self.browser = await self.playwright.chromium.launch(headless=True)
-            if self.context is None:
-                self.context = await self.browser.new_context()
-            self.last_used = asyncio.get_event_loop().time()
-            self.schedule_close()
+                
+                for _ in range(self.min_browsers):
+                    await self._create_browser_instance()
+                
+                if not self.cleanup_task:
+                    self.cleanup_task = asyncio.create_task(self._cleanup_idle_browsers())
+                
+                logger.info(f"✓ Initialized with {len(self.browsers)} browser instance(s)")
 
-    def schedule_close(self):
-        if self.close_task:
-            self.close_task.cancel()
-        self.close_task = asyncio.create_task(self.auto_close())
+    async def _create_browser_instance(self) -> BrowserInstance:
+        """Create a new browser instance with persistent context"""
+        browser = await self.playwright.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-web-security',  # For better compatibility
+                '--disable-features=IsolateOrigins,site-per-process'
+            ]
+        )
+        
+        # Create ONE context per browser - akan dipakai untuk semua requests
+        context = await browser.new_context(
+            viewport={'width': 1280, 'height': 720},
+            user_agent=self.get_user_agent(''),
+            extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
+            ignore_https_errors=True
+        )
+        
+        current_time = asyncio.get_event_loop().time()
+        instance = BrowserInstance(
+            browser=browser,
+            context=context,
+            semaphore=asyncio.Semaphore(self.max_tabs_per_browser),
+            created_at=current_time,
+            last_used=current_time
+        )
+        
+        self.browsers.append(instance)
+        self.stats['browsers_created'] += 1
+        
+        # Update peak
+        if len(self.browsers) > self.stats['peak_browsers']:
+            self.stats['peak_browsers'] = len(self.browsers)
+        
+        logger.info(f"✓ Created browser #{len(self.browsers)} (Total active: {len(self.browsers)}/{self.max_browsers})")
+        
+        return instance
 
-    async def auto_close(self, delay=900):
-        await asyncio.sleep(delay)
-        async with self.lock:
-            if asyncio.get_event_loop().time() - self.last_used >= delay:
-                await self.close()
-
-    async def close(self):
-        logger.info("Closing Playwright resources")
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-        self.playwright = self.browser = self.context = None
-        logger.info("Playwright resources closed")
+    async def _get_available_browser(self) -> Optional[BrowserInstance]:
+        """Get a browser instance with available capacity"""
+        # Try to find browser with available slots
+        for browser_instance in self.browsers:
+            if browser_instance.active_tabs < self.max_tabs_per_browser:
+                return browser_instance
+        
+        # Auto-scale if needed
+        if self.auto_scale and len(self.browsers) < self.max_browsers:
+            logger.info(f"⚡ All browsers full! Creating new instance ({len(self.browsers) + 1}/{self.max_browsers})")
+            async with self.lock:
+                return await self._create_browser_instance()
+        
+        # Load balance: return browser with least tabs
+        return min(self.browsers, key=lambda b: b.active_tabs)
 
     @asynccontextmanager
     async def get_page(self, domain: str = None):
+        """
+        Get a page from available browser instance
+        FIXED: Tidak recreate context setiap kali!
+        """
         await self.initialize()
-        self.last_used = asyncio.get_event_loop().time()
         
-        # Update context with domain-specific user agent
-        if domain:
-            user_agent = self.get_user_agent(domain)
-            await self.context.close()
-            self.context = await self.browser.new_context(
-                user_agent=user_agent,
-                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'}
-            )
+        browser_instance = await self._get_available_browser()
         
-        page = await self.context.new_page()
+        # Wait for slot
+        await browser_instance.semaphore.acquire()
+        
+        page = None
         try:
+            # Create page dengan user agent override TANPA recreate context
+            page = await browser_instance.context.new_page()
+            
+            # Override user agent untuk page ini saja jika perlu
+            if domain:
+                user_agent = self.get_user_agent(domain)
+                await page.set_extra_http_headers({
+                    'User-Agent': user_agent,
+                    'Accept-Language': 'en-US,en;q=0.9'
+                })
+            
+            # Update stats BEFORE yielding
+            browser_instance.active_tabs += 1
+            browser_instance.total_requests += 1
+            browser_instance.last_used = asyncio.get_event_loop().time()
+            self.stats['total_requests'] += 1
+            self.stats['active_tabs'] = sum(b.active_tabs for b in self.browsers)
+            
+            # Update peak
+            if self.stats['active_tabs'] > self.stats['peak_active_tabs']:
+                self.stats['peak_active_tabs'] = self.stats['active_tabs']
+            
+            browser_idx = self.browsers.index(browser_instance) + 1
+            logger.debug(f"📖 Tab opened [Browser {browser_idx}] - Active: {browser_instance.active_tabs}/{self.max_tabs_per_browser}")
+            
             yield page
+            
+            # Mark as successful if we reach here
+            self.stats['successful_requests'] += 1
+            
+        except Exception as e:
+            logger.error(f"❌ Error in page context: {e}")
+            self.stats['failed_requests'] += 1
+            raise
+            
         finally:
-            await page.close()
+            # Cleanup
+            if page:
+                try:
+                    await page.close()
+                except Exception as e:
+                    logger.error(f"Error closing page: {e}")
+            
+            browser_instance.active_tabs -= 1
+            browser_instance.semaphore.release()
+            self.stats['active_tabs'] = sum(b.active_tabs for b in self.browsers)
+            
+            browser_idx = self.browsers.index(browser_instance) + 1
+            logger.debug(f"📕 Tab closed [Browser {browser_idx}] - Active: {browser_instance.active_tabs}/{self.max_tabs_per_browser}")
+
+    async def _cleanup_idle_browsers(self):
+        """Background task to cleanup idle browser instances"""
+        while True:
+            try:
+                await asyncio.sleep(60)
+                
+                async with self.lock:
+                    current_time = asyncio.get_event_loop().time()
+                    browsers_to_remove = []
+                    
+                    for browser_instance in self.browsers:
+                        if len(self.browsers) <= self.min_browsers:
+                            break
+                        
+                        idle_time = current_time - browser_instance.last_used
+                        if (idle_time > self.browser_idle_timeout and 
+                            browser_instance.active_tabs == 0):
+                            browsers_to_remove.append(browser_instance)
+                    
+                    for browser_instance in browsers_to_remove:
+                        idle_time = current_time - browser_instance.last_used
+                        logger.info(f"🧹 Closing idle browser (idle: {int(idle_time)}s, requests served: {browser_instance.total_requests})")
+                        
+                        try:
+                            await browser_instance.context.close()
+                            await browser_instance.browser.close()
+                        except Exception as e:
+                            logger.error(f"Error closing browser: {e}")
+                        
+                        self.browsers.remove(browser_instance)
+                        self.stats['browsers_closed'] += 1
+                        
+            except Exception as e:
+                logger.error(f"Error in cleanup task: {e}")
+
+    async def close(self):
+        """Close all browser instances and playwright"""
+        logger.info("🛑 Closing all Playwright resources...")
+        
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        for browser_instance in self.browsers:
+            try:
+                await browser_instance.context.close()
+                await browser_instance.browser.close()
+            except Exception as e:
+                logger.error(f"Error closing browser: {e}")
+        
+        self.browsers.clear()
+        
+        if self.playwright:
+            await self.playwright.stop()
+            self.playwright = None
+        
+        logger.info("✓ All Playwright resources closed")
+
+    def get_stats(self) -> Dict:
+        """Get current statistics - REAL TIME"""
+        current_active_tabs = sum(b.active_tabs for b in self.browsers)
+        
+        return {
+            **self.stats,
+            'active_browsers': len(self.browsers),
+            'active_tabs': current_active_tabs,  # Real-time value
+            'total_capacity': len(self.browsers) * self.max_tabs_per_browser,
+            'capacity_used_percent': round((current_active_tabs / (len(self.browsers) * self.max_tabs_per_browser) * 100) if self.browsers else 0, 2),
+            'success_rate': round((self.stats['successful_requests'] / self.stats['total_requests'] * 100) if self.stats['total_requests'] > 0 else 0, 2),
+            'browsers_info': [
+                {
+                    'index': i + 1,
+                    'active_tabs': b.active_tabs,
+                    'max_tabs': self.max_tabs_per_browser,
+                    'total_requests': b.total_requests,
+                    'uptime_seconds': int(asyncio.get_event_loop().time() - b.created_at),
+                    'idle_seconds': int(asyncio.get_event_loop().time() - b.last_used),
+                    'utilization_percent': round((b.active_tabs / self.max_tabs_per_browser * 100), 2)
+                }
+                for i, b in enumerate(self.browsers)
+            ]
+        }
+    
+    def get_health_status(self) -> Dict:
+        """Quick health check"""
+        stats = self.get_stats()
+        
+        is_healthy = (
+            self.playwright is not None and
+            len(self.browsers) >= self.min_browsers and
+            stats['capacity_used_percent'] < 90
+        )
+        
+        return {
+            'status': 'healthy' if is_healthy else 'degraded',
+            'playwright_running': self.playwright is not None,
+            'browsers': len(self.browsers),
+            'active_tabs': stats['active_tabs'],
+            'capacity_used': f"{stats['capacity_used_percent']}%",
+            'total_requests': stats['total_requests'],
+            'success_rate': f"{stats['success_rate']}%"
+        }
+
+# Initialize global manager with configuration
+playwright_manager = AdvancedPlaywrightManager(
+    max_tabs_per_browser=25,
+    max_browsers=3,
+    auto_scale=True,
+    browser_idle_timeout=900,
+    min_browsers=1
+)
+
+async def get_page(domain: str = None):
+    """Helper function to get a page"""
+    return playwright_manager.get_page(domain)
 
 
-playwright_manager = PlaywrightManager()
-
-async def get_page():
-    return playwright_manager.get_page()
-
-def resolve_redirect(url: str) -> str:
-    try:
-        r = httpx.get(url, follow_redirects=True, timeout=10)
-        return str(r.url)  # final URL setelah semua redirect
-    except Exception as e:
-        print(f"Redirect error for {url}: {e}")
-        return url
-
-# Helper function for common page operations
+# Helper functions for navigation (unchanged)
 async def navigate_and_wait(page, url, timeout=30000):
     try:
         await page.route("**/*", lambda route: route.abort() 
@@ -114,37 +338,28 @@ async def navigate_and_wait(page, url, timeout=30000):
     except Exception as e:
         logger.error(f"Navigation error: {str(e)}")
         raise
-    finally:
-        await page.close()
 
 
 async def navigate_and_wait_v2(page, url, timeout=30000):
     try:
-        # Compile regex once for improved performance
         blocked_resources = re.compile(r'\.(png|jpg|jpeg|gif|css|woff|woff2|ttf|mp4|webp)$|analytics|tracking|advertisement')
         
-        # Only block certain requests
         async def handle_route(route):
             if blocked_resources.search(route.request.url):
                 await route.abort()
             else:
                 await route.continue_()
 
-        # Set user agent
         await page.set_extra_http_headers({
             "User-Agent": "WhatsApp/2.23.2.72 A"
         })
         
-        # Set up routing to block unnecessary resources
         await page.route("**/*", handle_route)
-        
-        # Go to the URL and wait for network to stabilize but not completely idle
         await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
     except Exception as e:
         logger.error(f"Error navigating to {url}: {str(e)}")
         raise
-    # finally:
-    #     await page.close()
+
 
 async def navigate_and_wait_v3(page, url, timeout=30000):
     try:
@@ -158,8 +373,7 @@ async def navigate_and_wait_v3(page, url, timeout=30000):
     except Exception as e:
         logger.error(f"Error navigating to {url}: {str(e)}")
         raise
-    # finally:
-    #     await page.close()
+
 
 async def navigate_to_resolve_redirect(url: str, timeout=10) -> str:
     try:
