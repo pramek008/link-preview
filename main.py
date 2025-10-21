@@ -1,10 +1,15 @@
+import asyncio
+from datetime import datetime
 import logging
 import os
-from fastapi import FastAPI
+import time
+from fastapi import BackgroundTasks, FastAPI
+from fastapi.responses import JSONResponse
 from routes.link_preview import router as link_preview_router
 from routes.debug import router as debug_router
+from routes.html_to_md_route import router as html_to_md_router
 from dotenv import load_dotenv
-from utils.playwright_utils import playwright_manager
+from utils.playwright_utils import AdvancedPlaywrightManager, playwright_manager
 
 load_dotenv()
 
@@ -14,17 +19,364 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 app.include_router(link_preview_router, tags=["link-preview"])
 app.include_router(debug_router,prefix="/debug", tags=["debug"])
+app.include_router(html_to_md_router, prefix="/html-to-markdown", tags=["html-to-markdown"])
 
-
+playwright_manager =  AdvancedPlaywrightManager(
+    max_tabs_per_browser=5,
+    max_browsers=3,
+    min_browsers=1,
+    auto_scale=True,
+    browser_idle_timeout=300  # 5 minutes
+)
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Initializing Playwright...")
+    """Initialize Playwright manager on startup"""
+    logger.info("Starting application...")
+    logger.info("Initializing Advanced Playwright Manager...")
     await playwright_manager.initialize()
+    logger.info("Playwright Manager initialized successfully")
+    logger.info(f"Configuration: {playwright_manager.max_tabs_per_browser} tabs/browser, "
+                f"{playwright_manager.max_browsers} max browsers, "
+                f"auto-scale: {playwright_manager.auto_scale}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("Closing Playwright...")
+    """Clean shutdown of all browser instances"""
+    logger.info("Shutting down application...")
+    logger.info("Closing Playwright Manager...")
     await playwright_manager.close()
+    logger.info("Playwright Manager closed successfully")
+
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "name": "Advanced Web Scraper API",
+        "version": "2.0.0",
+        "status": "running"
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    stats = playwright_manager.get_stats()
+    return {
+        "status": "healthy",
+        "playwright_initialized": playwright_manager.playwright is not None,
+        "active_browsers": stats['active_browsers'],
+        "active_tabs": stats['active_tabs'],
+        "total_capacity": stats['total_capacity']
+    }
+
+
+@app.get("/stats")
+async def get_stats():
+    """Get detailed statistics about browser instances"""
+    return JSONResponse(content=playwright_manager.get_stats())
+
+
+@app.post("/admin/scale-browsers")
+async def scale_browsers(target_browsers: int):
+    """Manually scale the number of browser instances"""
+    if target_browsers < playwright_manager.min_browsers:
+        return {
+            "error": f"Cannot scale below minimum ({playwright_manager.min_browsers})"
+        }
+    if target_browsers > playwright_manager.max_browsers:
+        return {
+            "error": f"Cannot scale above maximum ({playwright_manager.max_browsers})"
+        }
+    
+    current = len(playwright_manager.browsers)
+    
+    if target_browsers > current:
+        # Scale up
+        async with playwright_manager.lock:
+            for _ in range(target_browsers - current):
+                await playwright_manager._create_browser_instance()
+        return {
+            "action": "scaled_up",
+            "previous": current,
+            "current": len(playwright_manager.browsers)
+        }
+    elif target_browsers < current:
+        # Scale down (only close idle browsers with no active tabs)
+        async with playwright_manager.lock:
+            browsers_to_remove = []
+            for browser_instance in playwright_manager.browsers[target_browsers:]:
+                if browser_instance.active_tabs == 0:
+                    browsers_to_remove.append(browser_instance)
+            
+            for browser_instance in browsers_to_remove:
+                await browser_instance.context.close()
+                await browser_instance.browser.close()
+                playwright_manager.browsers.remove(browser_instance)
+        
+        return {
+            "action": "scaled_down",
+            "previous": current,
+            "current": len(playwright_manager.browsers),
+            "note": "Only closed idle browsers with no active tabs"
+        }
+    else:
+        return {
+            "action": "no_change",
+            "current": current
+        }
+
+
+@app.get("/admin/config")
+async def get_config():
+    """Get current configuration"""
+    return {
+        "max_tabs_per_browser": playwright_manager.max_tabs_per_browser,
+        "max_browsers": playwright_manager.max_browsers,
+        "min_browsers": playwright_manager.min_browsers,
+        "auto_scale": playwright_manager.auto_scale,
+        "browser_idle_timeout": playwright_manager.browser_idle_timeout
+    }
+
+@app.get("/debug/test-tab-opening")
+async def debug_test_tab_opening():
+    """
+    Test apakah tab benar-benar dibuka dan stats terupdate
+    """
+    stats_before = playwright_manager.get_stats()
+    
+    # Open a page and HOLD it (tidak langsung close)
+    async with playwright_manager.get_page("google.com") as page:
+        stats_during = playwright_manager.get_stats()
+        
+        # Wait a bit so we can check
+        await asyncio.sleep(2)
+        
+        stats_still_open = playwright_manager.get_stats()
+    
+    stats_after = playwright_manager.get_stats()
+    
+    return {
+        "test": "tab_opening",
+        "stats_before": stats_before,
+        "stats_during_open": stats_during,
+        "stats_still_open": stats_still_open,
+        "stats_after_close": stats_after,
+        "analysis": {
+            "tabs_increased": stats_during['active_tabs'] > stats_before['active_tabs'],
+            "tabs_decreased_after": stats_after['active_tabs'] < stats_during['active_tabs'],
+            "expected_behavior": "tabs should increase during and decrease after"
+        }
+    }
+
+
+@app.get("/debug/stress-test-internal")
+async def debug_stress_test_internal(num_requests: int = 10):
+    """
+    Internal stress test - buat multiple requests sekaligus
+    """
+    import time
+    
+    start_time = time.time()
+    stats_before = playwright_manager.get_stats()
+    
+    async def single_test(i: int):
+        try:
+            async with playwright_manager.get_page("test.com") as page:
+                await page.goto("https://example.com", timeout=5000)
+                return {"request": i, "success": True}
+        except Exception as e:
+            return {"request": i, "success": False, "error": str(e)}
+    
+    # Launch concurrent requests
+    tasks = [single_test(i) for i in range(num_requests)]
+    
+    # Get stats while running
+    stats_during = playwright_manager.get_stats()
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    duration = time.time() - start_time
+    stats_after = playwright_manager.get_stats()
+    
+    successful = sum(1 for r in results if isinstance(r, dict) and r.get("success"))
+    
+    return {
+        "test": "internal_stress_test",
+        "num_requests": num_requests,
+        "duration_seconds": round(duration, 2),
+        "successful": successful,
+        "failed": num_requests - successful,
+        "stats_before": stats_before,
+        "stats_during": stats_during,
+        "stats_after": stats_after,
+        "peak_tabs_detected": max(
+            stats_before['active_tabs'],
+            stats_during['active_tabs'],
+            stats_after.get('peak_active_tabs', 0)
+        ),
+        "results_sample": results[:3]
+    }
+
+
+@app.get("/debug/browser-info")
+async def debug_browser_info():
+    """
+    Detailed info tentang setiap browser instance
+    """
+    browsers_info = []
+    
+    for i, browser in enumerate(playwright_manager.browsers):
+        info = {
+            "index": i + 1,
+            "active_tabs": browser.active_tabs,
+            "total_requests": browser.total_requests,
+            "created_at": datetime.fromtimestamp(browser.created_at).isoformat(),
+            "last_used": datetime.fromtimestamp(browser.last_used).isoformat(),
+            "uptime_seconds": int(asyncio.get_event_loop().time() - browser.created_at),
+            "idle_seconds": int(asyncio.get_event_loop().time() - browser.last_used),
+            "semaphore_available": browser.semaphore._value,
+            "browser_is_connected": browser.browser.is_connected(),
+            "context_pages_count": len(browser.context.pages)
+        }
+        browsers_info.append(info)
+    
+    return {
+        "total_browsers": len(playwright_manager.browsers),
+        "config": {
+            "max_tabs_per_browser": playwright_manager.max_tabs_per_browser,
+            "max_browsers": playwright_manager.max_browsers,
+            "min_browsers": playwright_manager.min_browsers,
+            "auto_scale": playwright_manager.auto_scale
+        },
+        "browsers": browsers_info,
+        "current_stats": playwright_manager.get_stats()
+    }
+
+
+@app.get("/debug/simulate-load")
+async def debug_simulate_load(
+    concurrent: int = 5,
+    duration_seconds: int = 10,
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Simulate load in background untuk testing
+    """
+    async def background_load():
+        logger.info(f"🔥 Starting background load: {concurrent} concurrent for {duration_seconds}s")
+        
+        start_time = time.time()
+        request_count = 0
+        
+        async def single_request():
+            nonlocal request_count
+            try:
+                async with playwright_manager.get_page("example.com") as page:
+                    await page.goto("https://example.com", timeout=5000)
+                    request_count += 1
+                    return True
+            except Exception as e:
+                logger.error(f"Background request error: {e}")
+                return False
+        
+        while time.time() - start_time < duration_seconds:
+            tasks = [single_request() for _ in range(concurrent)]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(1)
+        
+        logger.info(f"✓ Background load completed: {request_count} requests processed")
+    
+    # Start in background
+    asyncio.create_task(background_load())
+    
+    return {
+        "message": "Background load started",
+        "concurrent_requests": concurrent,
+        "duration_seconds": duration_seconds,
+        "check_stats_at": "/stats or /debug/browser-info"
+    }
+
+
+@app.post("/debug/force-scale")
+async def debug_force_scale(num_browsers: int):
+    """
+    Force create atau remove browsers
+    """
+    current = len(playwright_manager.browsers)
+    
+    if num_browsers > playwright_manager.max_browsers:
+        return {"error": f"Cannot exceed max_browsers ({playwright_manager.max_browsers})"}
+    
+    if num_browsers > current:
+        # Scale up
+        async with playwright_manager.lock:
+            for _ in range(num_browsers - current):
+                await playwright_manager._create_browser_instance()
+        
+        return {
+            "action": "scaled_up",
+            "from": current,
+            "to": len(playwright_manager.browsers),
+            "stats": playwright_manager.get_stats()
+        }
+    
+    elif num_browsers < current:
+        # Scale down
+        async with playwright_manager.lock:
+            while len(playwright_manager.browsers) > num_browsers:
+                if len(playwright_manager.browsers) <= playwright_manager.min_browsers:
+                    break
+                
+                # Remove last browser if idle
+                browser = playwright_manager.browsers[-1]
+                if browser.active_tabs == 0:
+                    await browser.context.close()
+                    await browser.browser.close()
+                    playwright_manager.browsers.remove(browser)
+                else:
+                    break
+        
+        return {
+            "action": "scaled_down",
+            "from": current,
+            "to": len(playwright_manager.browsers),
+            "stats": playwright_manager.get_stats()
+        }
+    
+    return {
+        "action": "no_change",
+        "current": current,
+        "stats": playwright_manager.get_stats()
+    }
+
+
+@app.get("/debug/reset-stats")
+async def debug_reset_stats():
+    """Reset statistics"""
+    old_stats = playwright_manager.stats.copy()
+    
+    playwright_manager.stats = {
+        'total_requests': 0,
+        'active_tabs': 0,
+        'browsers_created': len(playwright_manager.browsers),
+        'browsers_closed': 0,
+        'failed_requests': 0,
+        'successful_requests': 0,
+        'peak_active_tabs': 0,
+        'peak_browsers': len(playwright_manager.browsers)
+    }
+    
+    # Reset per-browser stats
+    for browser in playwright_manager.browsers:
+        browser.total_requests = 0
+    
+    return {
+        "message": "Stats reset",
+        "old_stats": old_stats,
+        "new_stats": playwright_manager.get_stats()
+    }
 
 # import asyncio
 # import logging
