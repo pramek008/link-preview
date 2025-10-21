@@ -7,12 +7,9 @@ from models.schemas import LinkPreview
 from typing import Optional, List
 from fastapi import HTTPException
 import asyncio
-from utils.playwright_utils import PlaywrightManager, get_page, navigate_and_wait_v2, navigate_and_wait_v3, navigate_to_resolve_redirect, resolve_redirect
+from utils.playwright_utils import navigate_to_resolve_redirect, playwright_manager
 
 logger = logging.getLogger(__name__)
-
-# Global instance
-playwright_manager = PlaywrightManager()
 
 class LinkPreviewService:
     @staticmethod
@@ -278,22 +275,20 @@ class LinkPreviewService:
 
     @staticmethod
     async def get_link_preview(url: str) -> Optional[LinkPreview]:
-        domain = urlparse(url).netloc
-        # Resolve redirect untuk logging/checking
+        # FIXED: Gunakan resolved URL untuk navigate
         resolved_url = await navigate_to_resolve_redirect(url)
         logger.info(f"Resolved URL: {resolved_url}")
         
-        # Dapatkan domain yang benar untuk page pool
         resolved_domain = urlparse(resolved_url).netloc
         
+        # Pass domain untuk user agent
         async with playwright_manager.get_page(resolved_domain) as page:
             try:
-                # Setup optimizations
-                await LinkPreviewService.setup_page_optimizations(page, domain)
-                logger.info(f"Fetching preview for URL: {url}")                        
+                await LinkPreviewService.setup_page_optimizations(page, resolved_domain)
+                logger.info(f"Fetching preview for URL: {resolved_url}")
                 
-                # Navigate with shorter timeout and different wait strategy
-                response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                # PENTING: Navigate ke RESOLVED URL, bukan URL asli!
+                response = await page.goto(resolved_url, wait_until="domcontentloaded", timeout=15000)
                 
                 if not response or response.status >= 400:
                     logger.error(f"Failed to load page: {response.status if response else 'No response'}")

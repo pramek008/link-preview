@@ -4,3 +4,5 @@ playwright
 python-dotenv
 aiohttp
 httpx
+markdownify
+beautifulsoup4
